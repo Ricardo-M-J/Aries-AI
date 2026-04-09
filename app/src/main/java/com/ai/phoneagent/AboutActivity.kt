@@ -197,11 +197,28 @@ class AboutActivity : AppCompatActivity() {
             binding.btnCheckUpdate,
             binding.itemChangelog,
             binding.itemUserAgreement,
+            binding.itemUXProgram,
             binding.itemLicenses,
             binding.itemWebsite,
             binding.itemDeveloper,
             binding.itemContact,
         ).forEach { applySpringScaleEffect(it) }
+
+        // 获取并设置 UX Program 的初始状态
+        val sharedPrefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        val isUXProgramEnabled = sharedPrefs.getBoolean("ux_program_enabled", false)
+        binding.switchUXProgram.isChecked = isUXProgramEnabled
+
+        binding.itemUXProgram.setOnClickListener {
+            binding.switchUXProgram.toggle()
+        }
+
+        binding.switchUXProgram.setOnCheckedChangeListener { _, isChecked ->
+            vibrateLight()
+            sharedPrefs.edit().putBoolean("ux_program_enabled", isChecked).apply()
+            val msgRes = if (isChecked) R.string.about_ux_program_joined else R.string.about_ux_program_exited
+            Toast.makeText(this, msgRes, Toast.LENGTH_SHORT).show()
+        }
 
         // 检查更新
         binding.btnCheckUpdate.setOnClickListener {

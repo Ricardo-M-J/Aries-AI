@@ -35,7 +35,7 @@ android {
         minSdk = 30
         targetSdk = 36
         versionCode = 16
-        versionName = "1.4.0"
+        versionName = "1.4.3"
 
         buildConfigField("String", "GITHUB_TOKEN", "\"\"")
 

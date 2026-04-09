@@ -218,6 +218,61 @@
                         android:background="@android:color/transparent" />
 
                     <LinearLayout
+                        android:id="@+id/itemUXProgram"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="?attr/selectableItemBackground"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:minHeight="@dimen/m3t_about_item_height"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="@dimen/m3t_about_row_padding_h"
+                        android:paddingEnd="@dimen/m3t_about_row_padding_h"
+                        android:paddingTop="@dimen/m3t_spacing_xs"
+                        android:paddingBottom="@dimen/m3t_spacing_xs">
+
+                        <ImageView
+                            android:layout_width="@dimen/m3t_about_row_icon_size"
+                            android:layout_height="@dimen/m3t_about_row_icon_size"
+                            android:src="@drawable/ic_history_24"
+                            app:tint="@color/m3t_primary" />
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="@dimen/m3t_about_row_text_gap"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="@string/about_ux_program"
+                                android:textAppearance="@style/TextAppearance.M3t.Body.Medium" />
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:text="@string/about_ux_program_desc"
+                                android:textColor="@color/m3t_on_surface_variant"
+                                android:textSize="12sp" />
+                        </LinearLayout>
+
+                        <com.google.android.material.materialswitch.MaterialSwitch
+                            android:id="@+id/switchUXProgram"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content" />
+                    </LinearLayout>
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="@dimen/m3t_size_zero"
+                        android:layout_marginStart="@dimen/m3t_toolbar_nav_size"
+                        android:background="@android:color/transparent" />
+
+                    <LinearLayout
                         android:id="@+id/itemLicenses"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/m3t_about_item_height"
