@@ -3,7 +3,7 @@
  * 负责星空、星座连线、流星等视觉效果
  */
 
-(function() {
+(function () {
   'use strict';
 
   function throttle(fn, delay) {
@@ -53,14 +53,14 @@
           const delay = Math.random() * 5;
           star.style.width = size + 'px';
           star.style.height = size + 'px';
-          
+
           // 在网格内部加上随机偏移
           const offsetX = Math.random() * (cellWidth * 0.7) + cellWidth * 0.15;
           const offsetY = Math.random() * (cellHeight * 0.7) + cellHeight * 0.15;
-          
+
           star.style.left = (c * cellWidth + offsetX) + '%';
           star.style.top = (r * cellHeight + offsetY) + '%';
-          
+
           star.style.setProperty('--opacity', opacity.toString());
           star.style.setProperty('--duration', duration + 's');
           star.style.setProperty('--delay', delay + 's');
