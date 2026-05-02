@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Aries AI - Android UI Automation Framework
  * Copyright (C) 2025-2026 ZG0704666
  *
@@ -113,23 +113,25 @@ data class AgentConfiguration(
     /**
      * 温度参数。
      *
-     * 自动化任务通常希望确定性更强，因此默认接近 0。
+     * null 表示不传给 API，由服务端使用模型默认值。
+     * 不同模型对 temperature 的约束不同（如 kimi-k2.5 仅允许 1），
+     * 留空可最大程度兼容各厂商 API。
      */
-    val temperature: Float? = 0.0f,
+    val temperature: Float? = null,
     
     /**
      * top_p 参数（nucleus sampling）。
      *
-     * 对自动化类任务：用于控制输出多样性，过高可能更“发散”。
+     * null 表示不传给 API，由服务端使用模型默认值。
      */
-    val topP: Float? = 0.85f,
+    val topP: Float? = null,
     
     /**
      * 频率惩罚（frequency penalty）。
      *
-     * 用于减少重复 token（如重复输出同一指令/同一句话）。
+     * null 表示不传给 API，由服务端使用模型默认值。
      */
-    val frequencyPenalty: Float? = 0.2f,
+    val frequencyPenalty: Float? = null,
     
     /**
      * 最大 token 数。
@@ -221,7 +223,7 @@ data class AgentConfiguration(
     
     // ========== UI树参数 ==========
     /** UI 树最多保留节点数（用于摘要/精简）。越大信息越全但 token 越多 */
-    val uiTreeMaxNodes: Int = 30,
+    val uiTreeMaxNodes: Int = 60,
 
     /** Shizuku UI 树摘要节点上限（结构化精简专用） */
     val shizukuUiTreeMaxNodes: Int = 40,

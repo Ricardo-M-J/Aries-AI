@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Aries AI - Android UI Automation Framework
  * Copyright (C) 2025-2026 ZG0704666
  *
@@ -19,11 +19,16 @@ package com.ai.phoneagent
 
 import android.content.Context
 import com.ai.phoneagent.core.agent.ParsedAgentAction
+import com.ai.phoneagent.core.agent.StepRecord
+import com.ai.phoneagent.core.agent.StepRecorder
 import com.ai.phoneagent.core.cache.ScreenshotManager
 import com.ai.phoneagent.core.config.AgentConfiguration
 import com.ai.phoneagent.core.executor.ActionExecutor
+import com.ai.phoneagent.core.memory.ActionMemory
+import com.ai.phoneagent.core.memory.SemanticAction
 import com.ai.phoneagent.core.parser.ActionParser
 import com.ai.phoneagent.core.templates.PromptTemplates
+import com.ai.phoneagent.core.tools.AppPackageManager
 import com.ai.phoneagent.core.utils.ActionUtils
 import com.ai.phoneagent.net.AutoGlmClient
 import com.ai.phoneagent.net.ChatRequestMessage
@@ -61,6 +66,7 @@ class UiAutomationAgent(
     // 组件实例化
     private val actionParser = ActionParser()
     private val actionExecutor = ActionExecutor(appContext, config)
+    private val actionMemory = ActionMemory(appContext)
     private var screenshotManager: ScreenshotManager? = null
 
     // Tap+Type 合并执行状态
@@ -86,11 +92,13 @@ class UiAutomationAgent(
     interface Control {
         fun isPaused(): Boolean
         suspend fun confirm(message: String): Boolean
+        fun speak(text: String) {}
     }
 
     private object NoopControl : Control {
         override fun isPaused(): Boolean = false
         override suspend fun confirm(message: String): Boolean = false
+        override fun speak(text: String) {}
     }
 
     private class TakeOverException(message: String) : RuntimeException(message)
@@ -99,7 +107,25 @@ class UiAutomationAgent(
             val success: Boolean,
             val message: String,
             val steps: Int,
-    )
+            val stepSummary: String = "",
+            val fraudWarning: String = "",
+    ) {
+        companion object {
+            fun withFraudCheck(
+                success: Boolean,
+                message: String,
+                steps: Int,
+                stepSummary: String = "",
+                stepRecorder: StepRecorder? = null,
+            ): AgentResult {
+                val fraudHits = stepRecorder?.detectFraud() ?: emptyList()
+                val fraudWarning = if (fraudHits.isNotEmpty()) {
+                    "⚠️ 安全风险提示：检测到敏感关键词「${fraudHits.joinToString("、")}」，请注意核实操作对象的真实性，谨防诈骗！"
+                } else ""
+                return AgentResult(success, message, steps, stepSummary, fraudWarning)
+            }
+        }
+    }
 
     /** 运行Agent执行任务 */
     suspend fun run(
@@ -175,6 +201,9 @@ class UiAutomationAgent(
             screenW: Int,
             screenH: Int,
     ): AgentResult {
+        val appPrefs = appContext.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        val useLocalModel = appPrefs.getBoolean("api_use_local_model", false)
+
         // 智能应用启动
         val smartLaunched = trySmartAppLaunch(task, service, onLog)
         if (smartLaunched) {
@@ -199,7 +228,8 @@ class UiAutomationAgent(
                                         screenW = screenW,
                                         screenH = screenH,
                                         config = null,
-                                        enforceDesc = useThirdPartyApi
+                                        enforceDesc = useThirdPartyApi,
+                                        useLocalModel = useLocalModel
                                 )
                 )
 
@@ -210,14 +240,41 @@ class UiAutomationAgent(
         lastActionWasTap = false
         lastTapAction = null
 
+        val stepRecorder = StepRecorder()
+
         var step = 0
         var currentScreenW = screenW
         var currentScreenH = screenH
+        var memoryReplayFailed = false
+        android.util.Log.w("AgentLoop", "runAgentLoop started: task='$task'")
 
         while (step < config.maxSteps) {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             awaitIfPaused(control)
             step++
+
+            // ActionMemory: 尝试从记忆中重放
+            if (step == 1 && !memoryReplayFailed) {
+                val memory = actionMemory.recall(task)
+                onLog("[Memory] recall('$task') => ${memory?.fingerprint?.take(12) ?: "null"}")
+                if (memory != null && memory.actions.isNotEmpty()) {
+                    onLog("[Step 1] 🧠 命中动作记忆: ${memory.taskDescription} (${memory.actions.size}步)")
+                    AutomationOverlay.updateProgress(step = 1, phaseInStep = 0.1f, maxSteps = config.maxSteps, subtitle = "重放记忆")
+                    val replayOk = tryReplayMemory(memory, task, control, onLog, service, screenW, screenH, stepRecorder)
+                    if (replayOk) {
+                        actionMemory.recordSuccess(memory.fingerprint)
+                        val summary = stepRecorder.generateSummary(task)
+                        onLog(summary)
+                        return AgentResult.withFraudCheck(true, "从记忆重放完成", stepRecorder.getStepCount(), summary, stepRecorder)
+                    }
+                    onLog("[Step 1] 记忆重放失败，回退到模型推理")
+                    actionMemory.recordFailure(memory.fingerprint)
+                    memoryReplayFailed = true
+                    step = 0
+                    stepRecorder.clear()
+                    continue
+                }
+            }
 
             // 虚拟屏模式下刷新当前内容尺寸，适配动态分辨率变化
             if (config.useBackgroundVirtualDisplay &&
@@ -299,7 +356,9 @@ class UiAutomationAgent(
 
             // 构建用户消息
             val userMsg =
-                    if (step == 1) {
+                    if (useLocalModel) {
+                        "任务：$task"
+                    } else if (step == 1) {
                         "$task\n\n$screenInfo\n\nUI树：\n$uiDump"
                     } else {
                         "$screenInfo\n\nUI树：\n$uiDump"
@@ -342,12 +401,18 @@ class UiAutomationAgent(
             AutomationOverlay.startThinking()
 
             // 调用模型
+            val messagesToSend = if (useLocalModel) {
+                // 本地模型只发送系统提示+最新用户消息，不累积历史
+                listOf(history.first()) + listOf(history.last())
+            } else {
+                history
+            }
             val replyResult =
                     requestModelWithRetry(
                             apiKey = apiKey,
                             baseUrl = baseUrl,
                             model = model,
-                            messages = history,
+                            messages = messagesToSend,
                             step = step,
                             purpose = "请求模型",
                             onLog = onLog,
@@ -360,7 +425,7 @@ class UiAutomationAgent(
             if (finalReply.isBlank()) {
                 val err = replyResult.exceptionOrNull()
                 val msg = err?.message?.trim().orEmpty().ifBlank { "模型无回复或请求失败" }
-                return AgentResult(false, "模型请求失败：${msg.take(320)}", step)
+                return AgentResult.withFraudCheck(false, "模型请求失败：${msg.take(320)}", step, stepRecorder.generateSummary(task), stepRecorder)
             }
 
             // 更新进度
@@ -399,19 +464,40 @@ class UiAutomationAgent(
                             step = step,
                             answerText = answer,
                             onLog = onLog,
+                            isLocal = useLocalModel,
                     )
 
             // 检查是否完成
             if (action.metadata == "finish") {
                 val msg = action.fields["message"].orEmpty().ifBlank { "已完成" }
-                return AgentResult(true, msg, step)
+                stepRecorder.record(
+                    StepRecord(
+                        stepNumber = step,
+                        actionName = "finish",
+                        displayName = msg.take(config.subtitleMaxLength),
+                        actionDetails = action.fields,
+                        success = true,
+                        thinking = thinking,
+                        appContext = currentApp,
+                    )
+                )
+                try {
+                    saveToMemory(task, stepRecorder, onLog)
+                } catch (e: Exception) {
+                    onLog("[Memory] saveToMemory failed: ${e.message}")
+                }
+                val summary = stepRecorder.generateSummary(task)
+                onLog(summary)
+                return AgentResult.withFraudCheck(true, msg, step, summary, stepRecorder)
             }
 
             if (action.metadata != "do") {
-                return AgentResult(
+                return AgentResult.withFraudCheck(
                         false,
                         "无法解析动作：${action.raw.take(config.logStepTruncateLength)}",
-                        step
+                        step,
+                        stepRecorder.generateSummary(task),
+                        stepRecorder,
                 )
             }
 
@@ -422,6 +508,28 @@ class UiAutomationAgent(
                     maxSteps = config.maxSteps,
                     subtitle = "准备执行"
             )
+
+            // 关键步骤确认检测
+            val criticalCheck = isCriticalStep(action, uiDump, thinking, task)
+            if (criticalCheck != null) {
+                val narration = stepRecorder.generateCriticalStepNarration(resolveActionSubtitle(action), task)
+                onLog("[Step $step] ⚠️ 关键步骤确认: $criticalCheck")
+                onLog("[Step $step] 📢 语音叙述: $narration")
+                control.speak(narration)
+                AutomationOverlay.updateProgress(
+                        step = step,
+                        phaseInStep = 0.65f,
+                        maxSteps = config.maxSteps,
+                        subtitle = "等待确认"
+                )
+                val userConfirmed = control.confirm(criticalCheck)
+                if (!userConfirmed) {
+                    stepRecorder.recordSkip(step, action.actionName ?: "", "用户拒绝执行关键步骤", currentApp)
+                    onLog("[Step $step] 用户拒绝执行，跳过该步骤")
+                    return AgentResult.withFraudCheck(false, "用户拒绝执行关键步骤", step, stepRecorder.generateSummary(task), stepRecorder)
+                }
+                onLog("[Step $step] 用户确认执行")
+            }
 
             // 执行动作
             var currentAction = action
@@ -449,12 +557,12 @@ class UiAutomationAgent(
                 // Take_over 处理
                 if (actionName == "take_over" || actionName == "takeover") {
                     val msg = currentAction.fields["message"].orEmpty().ifBlank { "需要用户接管" }
-                    return AgentResult(false, msg, step)
+                    return AgentResult.withFraudCheck(false, msg, step, stepRecorder.generateSummary(task), stepRecorder)
                 }
 
                 // Note/Call_api 处理
                 if (actionName == "note" || actionName == "call_api" || actionName == "interact") {
-                    return AgentResult(false, "需要用户交互/扩展能力：${currentAction.raw.take(180)}", step)
+                    return AgentResult.withFraudCheck(false, "需要用户交互/扩展能力：${currentAction.raw.take(180)}", step, stepRecorder.generateSummary(task), stepRecorder)
                 }
 
                 // Tap+Type 合并执行检测
@@ -521,7 +629,7 @@ class UiAutomationAgent(
                             result
                         } catch (e: TakeOverException) {
                             val msg = e.message.orEmpty().ifBlank { "需要用户接管" }
-                            return AgentResult(false, msg, step)
+                            return AgentResult.withFraudCheck(false, msg, step, stepRecorder.generateSummary(task), stepRecorder)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
@@ -531,14 +639,49 @@ class UiAutomationAgent(
                             false
                         }
 
-                if (execOk) break
+                if (execOk) {
+                    val (cx, cy) = parseActionCoordinates(currentAction)
+                    stepRecorder.record(
+                        StepRecord(
+                            stepNumber = step,
+                            actionName = currentAction.actionName ?: "",
+                            displayName = overlayActionText,
+                            actionDetails = currentAction.fields,
+                            success = true,
+                            thinking = thinking,
+                            appContext = currentApp,
+                            clickX = cx,
+                            clickY = cy,
+                        )
+                    )
+                    // 循环检测
+                    if (detectLoop(stepRecorder)) {
+                        onLog("[Step $step] 🔄 检测到操作循环，任务终止")
+                        val summary = stepRecorder.generateSummary(task)
+                        return AgentResult.withFraudCheck(false, "检测到操作循环，任务终止", step, summary, stepRecorder)
+                    }
+                    break
+                }
 
                 // 动作执行失败，尝试修复
                 if (repairAttempt >= config.maxActionRepairs) {
+                    stepRecorder.record(
+                        StepRecord(
+                            stepNumber = step,
+                            actionName = currentAction.actionName ?: "",
+                            displayName = overlayActionText,
+                            actionDetails = currentAction.fields,
+                            success = false,
+                            thinking = thinking,
+                            appContext = currentApp,
+                        )
+                    )
+                    val summary = stepRecorder.generateSummary(task)
                     return AgentResult(
                             false,
                             "动作执行失败：${currentAction.raw.take(config.logStepTruncateLength)}",
-                            step
+                            step,
+                            stepSummary = summary,
                     )
                 }
 
@@ -554,10 +697,14 @@ class UiAutomationAgent(
 
                 // 构建修复消息
                 val failMsg =
-                        PromptTemplates.buildActionRepairPrompt(
-                                currentAction.raw,
-                                enforceDesc = useThirdPartyApi
-                        )
+                        if (useLocalModel) {
+                            PromptTemplates.buildLocalModelRepairPrompt(currentAction.raw)
+                        } else {
+                            PromptTemplates.buildActionRepairPrompt(
+                                    currentAction.raw,
+                                    enforceDesc = useThirdPartyApi
+                            )
+                        }
                 history += ChatRequestMessage(role = "user", content = failMsg)
 
                 val fixResult =
@@ -575,7 +722,7 @@ class UiAutomationAgent(
                 if (fixFinal.isBlank()) {
                     val err = fixResult.exceptionOrNull()
                     val msg = err?.message?.trim().orEmpty().ifBlank { "模型无回复或请求失败" }
-                    return AgentResult(false, "动作修复失败：${msg.take(320)}", step)
+                    return AgentResult.withFraudCheck(false, "动作修复失败：${msg.take(320)}", step, stepRecorder.generateSummary(task), stepRecorder)
                 }
 
                 AutomationOverlay.updateProgress(
@@ -602,18 +749,75 @@ class UiAutomationAgent(
                                 step = step,
                                 answerText = fixAnswer,
                                 onLog = onLog,
+                                isLocal = useLocalModel,
                         )
 
                 if (currentAction.metadata == "finish") {
+                    if (step < 3) {
+                        onLog("[Step $step] 模型返回finish但步数不足(${step}步)，强制继续")
+                        onLog("[Step $step] 请继续执行任务，不要提前结束")
+                        continue
+                    }
                     val msg = currentAction.fields["message"].orEmpty().ifBlank { "已完成" }
-                    return AgentResult(true, msg, step)
+                    stepRecorder.record(
+                        StepRecord(
+                            stepNumber = step,
+                            actionName = "finish",
+                            displayName = msg.take(config.subtitleMaxLength),
+                            actionDetails = currentAction.fields,
+                            success = true,
+                            thinking = null,
+                            appContext = currentApp,
+                        )
+                    )
+                    try {
+                        saveToMemory(task, stepRecorder, onLog)
+                    } catch (e: Exception) {
+                        onLog("[Memory] saveToMemory(repair) failed: ${e.message}")
+                    }
+                    val summary = stepRecorder.generateSummary(task)
+                    onLog(summary)
+                    return AgentResult.withFraudCheck(true, msg, step, summary, stepRecorder)
                 }
                 if (currentAction.metadata != "do") {
-                    return AgentResult(
+                    return AgentResult.withFraudCheck(
                             false,
                             "无法解析动作：${currentAction.raw.take(config.logStepTruncateLength)}",
-                            step
+                            step,
+                            stepRecorder.generateSummary(task),
+                            stepRecorder,
                     )
+                }
+            }
+
+            // 智能完成检测（动作执行后）：检查最后一个关键词是否在当前页面可见
+            val taskKeywords = task.replace(Regex("[打开找到查看跳转进入]"), "").trim().split("[，,\\s]+".toRegex())
+            val lastKeyword = taskKeywords.lastOrNull { it.length >= 2 } ?: ""
+            if (lastKeyword.isNotBlank() && uiDump.contains(lastKeyword, ignoreCase = true)) {
+                val recentSteps = stepRecorder.getSteps().takeLast(2)
+                val stayedOnSamePage = recentSteps.size >= 2 && recentSteps.all { it.appContext == currentApp }
+                if (stayedOnSamePage && step >= 3) {
+                    onLog("[Step $step] 智能完成：检测到目标 '$lastKeyword' 在当前页面")
+                    val msg = "已到达目标页面：$lastKeyword"
+                    stepRecorder.record(
+                        StepRecord(
+                            stepNumber = step,
+                            actionName = "finish",
+                            displayName = msg.take(config.subtitleMaxLength),
+                            actionDetails = mapOf("message" to msg),
+                            success = true,
+                            thinking = thinking,
+                            appContext = currentApp,
+                        )
+                    )
+                    try {
+                        saveToMemory(task, stepRecorder, onLog)
+                    } catch (e: Exception) {
+                        onLog("[Memory] saveToMemory failed: ${e.message}")
+                    }
+                    val summary = stepRecorder.generateSummary(task)
+                    onLog(summary)
+                    return AgentResult.withFraudCheck(true, msg, step, summary, stepRecorder)
                 }
             }
 
@@ -641,7 +845,7 @@ class UiAutomationAgent(
             delay((config.stepDelayMs + extraDelayMs).coerceAtLeast(0L))
         }
 
-        return AgentResult(false, "达到最大步数限制（${config.maxSteps}）", config.maxSteps)
+        return AgentResult.withFraudCheck(false, "达到最大步数限制（${config.maxSteps}）", config.maxSteps, stepRecorder.generateSummary(task), stepRecorder)
     } // end of run()
 
     /** 清理虚拟屏及预览悬浮窗资源 */
@@ -1062,6 +1266,7 @@ class UiAutomationAgent(
             step: Int,
             answerText: String,
             onLog: (String) -> Unit,
+            isLocal: Boolean = false,
     ): ParsedAgentAction {
         var action =
                 actionParser.parse(ActionUtils.extractFirstActionSnippet(answerText) ?: answerText)
@@ -1089,7 +1294,11 @@ class UiAutomationAgent(
             repairHistory.add(
                     ChatRequestMessage(
                             role = "user",
-                            content = PromptTemplates.buildRepairPrompt(enforceDesc = enforceDesc)
+                            content = if (isLocal) {
+                                PromptTemplates.buildLocalModelRepairPrompt(action.raw)
+                            } else {
+                                PromptTemplates.buildRepairPrompt(enforceDesc = enforceDesc)
+                            }
                     )
             )
 
@@ -1192,6 +1401,242 @@ class UiAutomationAgent(
         while (control.isPaused()) {
             delay(config.pauseCheckIntervalMs)
         }
+    }
+
+    private fun isCriticalStep(
+        action: ParsedAgentAction,
+        uiDump: String,
+        thinking: String?,
+        task: String = ""
+    ): String? {
+        val actionName = action.actionName?.trim()?.lowercase().orEmpty()
+        val allText = buildString {
+            append(actionName)
+            append(" ")
+            action.fields.values.forEach { append(it); append(" ") }
+            thinking?.let { append(it); append(" ") }
+            append(task)
+        }
+
+        val dangerousActions = setOf("confirm_payment", "confirm_transfer", "submit_payment", "pay", "transfer")
+        if (actionName in dangerousActions) {
+            return "即将执行「${resolveActionSubtitle(action)}」，这是涉及资金的操作，请确认是否继续？"
+        }
+
+        val sensitiveKeywords = listOf(
+            "支付密码", "银行卡", "信用卡", "卡号", "cvv", "安全码",
+            "验证码", "短信验证码", "确认支付", "确认付款", "转账", "汇款",
+            "登录密码", "输入密码", "身份证号", "身份证",
+        )
+        val matchedSensitive = sensitiveKeywords.filter { uiDump.contains(it, ignoreCase = true) }
+        if (matchedSensitive.isNotEmpty()) {
+            return "检测到当前界面包含敏感信息（${matchedSensitive.take(3).joinToString("、")}），即将执行「${resolveActionSubtitle(action)}」，请确认是否继续？"
+        }
+
+        val dangerousThinkingKeywords = listOf("支付", "转账", "汇款", "密码", "确认付款", "输入密码", "验证码")
+        val matchedThinking = dangerousThinkingKeywords.filter { allText.contains(it, ignoreCase = true) }
+        if (matchedThinking.size >= 2) {
+            return "该步骤可能涉及${matchedThinking.take(3).joinToString("、")}等操作，即将执行「${resolveActionSubtitle(action)}」，请确认是否继续？"
+        }
+
+        // 单关键词强敏感检测（如密码、验证码等）
+        val highRiskKeywords = listOf("密码", "验证码", "银行卡", "身份证号", "转账", "支付")
+        val matchedHighRisk = highRiskKeywords.filter { allText.contains(it, ignoreCase = true) }
+        if (matchedHighRisk.isNotEmpty()) {
+            return "该步骤涉及「${matchedHighRisk.first()}」等敏感信息，即将执行「${resolveActionSubtitle(action)}」，请确认是否继续？"
+        }
+
+        return null
+    }
+
+    private suspend fun tryReplayMemory(
+        memory: com.ai.phoneagent.core.memory.ActionMemoryEntry,
+        task: String,
+        control: Control,
+        onLog: (String) -> Unit,
+        service: PhoneAgentAccessibilityService?,
+        screenW: Int,
+        screenH: Int,
+        stepRecorder: StepRecorder,
+    ): Boolean {
+        for ((idx, semantic) in memory.actions.withIndex()) {
+            val stepNum = idx + 1
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            awaitIfPaused(control)
+
+            val uiDump = try {
+                service?.dumpUiTreeWithRetry(maxNodes = config.uiTreeMaxNodes) ?: ""
+            } catch (_: Exception) { "" }
+
+            val targetAction = buildReplayAction(semantic, uiDump)
+            if (targetAction == null) {
+                onLog("[Replay Step $stepNum] cannot locate target: ${semantic.target}")
+                return false
+            }
+
+            AutomationOverlay.updateProgress(step = stepNum, phaseInStep = 0.5f, maxSteps = memory.actions.size, subtitle = semantic.actionName)
+            onLog("[Replay Step $stepNum] ${semantic.actionName}: ${semantic.target}")
+
+            val execOk = actionExecutor.execute(targetAction, service, uiDump, screenW, screenH, onLog)
+            if (!execOk) {
+                onLog("[Replay Step $stepNum] execution failed")
+                return false
+            }
+
+            stepRecorder.record(
+                StepRecord(
+                    stepNumber = stepNum,
+                    actionName = semantic.actionName,
+                    displayName = semantic.target.take(config.subtitleMaxLength),
+                    actionDetails = mapOf("target" to semantic.target, "value" to semantic.value),
+                    success = true,
+                    thinking = null,
+                    appContext = semantic.appContext,
+                )
+            )
+            delay(config.stepDelayMs)
+        }
+        return true
+    }
+
+    private fun buildReplayAction(semantic: SemanticAction, uiDump: String): ParsedAgentAction? {
+        val target = semantic.target.trim()
+
+        val fields = mutableMapOf<String, String>()
+
+        // 优先使用坐标重放（如果坐标有效）
+        if (semantic.clickX >= 0 && semantic.clickY >= 0) {
+            fields["element"] = "[${semantic.clickX},${semantic.clickY}]"
+            fields["desc"] = semantic.target
+            if (semantic.value.isNotBlank()) fields["text"] = semantic.value
+            return ParsedAgentAction(
+                raw = "action: ${semantic.actionName}, element: [${semantic.clickX},${semantic.clickY}]",
+                actionName = semantic.actionName,
+                fields = fields,
+                metadata = "do",
+            )
+        }
+
+        if (target.isBlank()) return null
+
+        when (semantic.actionName.lowercase()) {
+            "open_app" -> {
+                val pkg = AppPackageManager.resolvePackageName(target)
+                if (pkg != null) {
+                    return ParsedAgentAction(
+                        raw = "action: open_app, app_name: $target",
+                        actionName = "open_app",
+                        fields = mapOf("app_name" to (pkg)),
+                        metadata = "do",
+                    )
+                }
+                return null
+            }
+            "press", "press_back", "press_home", "home", "back", "enter" -> {
+                return ParsedAgentAction(
+                    raw = "action: ${semantic.actionName}",
+                    actionName = semantic.actionName.lowercase(),
+                    fields = emptyMap(),
+                    metadata = "do",
+                )
+            }
+            "swipe", "scroll" -> {
+                // Swipe without coordinates falls back to text matching
+                return null
+            }
+            "tap", "click" -> {
+                // Tap without coordinates falls back to text matching
+                return null
+            }
+            "type", "input" -> {
+                fields["text"] = semantic.value
+                fields["desc"] = semantic.target
+                return ParsedAgentAction(
+                    raw = "action: type, text: ${semantic.value}, desc: ${semantic.target}",
+                    actionName = "type",
+                    fields = fields,
+                    metadata = "do",
+                )
+            }
+        }
+
+        val targetLower = target.lowercase()
+        val escaped = Regex.escape(targetLower)
+
+        val contentDescMatch = Regex("""content-desc="([^"]{0,80}$escaped[^"]{0,80})"""", RegexOption.IGNORE_CASE)
+            .find(uiDump)?.groupValues?.get(1)
+
+        val textMatch = Regex("""text="([^"]{0,80}$escaped[^"]{0,80})"""", RegexOption.IGNORE_CASE)
+            .find(uiDump)?.groupValues?.get(1)
+
+        val match = contentDescMatch ?: textMatch
+        if (match != null) {
+            fields["desc"] = match
+            if (semantic.value.isNotBlank()) fields["text"] = semantic.value
+            return ParsedAgentAction(
+                raw = "action: ${semantic.actionName}, desc: $match",
+                actionName = semantic.actionName,
+                fields = fields,
+                metadata = "do",
+            )
+        }
+
+        return null
+    }
+
+    private fun saveToMemory(task: String, stepRecorder: StepRecorder, onLog: (String) -> Unit) {
+        val uiActionNames = setOf("tap", "click", "swipe", "scroll", "type", "input", "back", "home", "enter", "longpress", "drag")
+        val semanticActions = stepRecorder.getSteps()
+            .filter { !it.skipped && it.success && it.actionName.lowercase() in uiActionNames }
+            .map { step ->
+                SemanticAction(
+                    actionName = step.actionName,
+                    target = step.displayName,
+                    value = step.actionDetails["text"].orEmpty(),
+                    appContext = step.appContext,
+                    clickX = step.clickX,
+                    clickY = step.clickY,
+                )
+            }
+        onLog("[Memory] saveToMemory: task='$task', actions=${semanticActions.size} (filtered from ${stepRecorder.getSteps().size})")
+        if (semanticActions.size >= 2) {
+            val entry = actionMemory.remember(task, semanticActions)
+            onLog("[Memory] Saved: fp=${entry.fingerprint.take(12)}, count=${entry.actions.size}")
+        } else {
+            onLog("[Memory] Skipped: only ${semanticActions.size} UI actions (need >=2)")
+        }
+    }
+
+    /**
+     * 从动作字段中解析点击坐标。
+     * 支持 element=[x,y]、point=[x,y]、pos=[x,y]、x=、y= 等格式。
+     */
+    private fun parseActionCoordinates(action: ParsedAgentAction): Pair<Int, Int> {
+        val fields = action.fields
+        val element = fields["element"] ?: fields["point"] ?: fields["pos"] ?: ""
+        val xy = element.trim('[', ']').split(',').map { it.trim().toIntOrNull() }
+        if (xy.size == 2 && xy[0] != null && xy[1] != null) {
+            return xy[0]!! to xy[1]!!
+        }
+        val x = fields["x"]?.toIntOrNull() ?: -1
+        val y = fields["y"]?.toIntOrNull() ?: -1
+        return x to y
+    }
+
+    /**
+     * 检测最近的操作是否形成循环。
+     * 检查最近 6 步，如果同一 (appContext + actionName + displayName) 组合出现 3 次以上，判定为循环。
+     */
+    private fun detectLoop(stepRecorder: StepRecorder): Boolean {
+        val steps = stepRecorder.getSteps()
+        if (steps.size < 6) return false
+        val recent = steps.takeLast(6)
+        val counts = mutableMapOf<String, Int>()
+        for (s in recent) {
+            val key = "${s.appContext}|${s.actionName}|${s.displayName}"
+            counts[key] = (counts[key] ?: 0) + 1
+        }
+        return counts.any { it.value >= 3 }
     }
 
     /** 修剪历史消息，保持上下文在限制内 */

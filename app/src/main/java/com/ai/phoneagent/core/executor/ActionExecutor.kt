@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Aries AI - Android UI Automation Framework
  * Copyright (C) 2025-2026 ZG0704666
  *
@@ -20,6 +20,8 @@ package com.ai.phoneagent.core.executor
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
+import android.util.Log
+import android.view.accessibility.AccessibilityNodeInfo
 import com.ai.phoneagent.AutomationOverlay
 import com.ai.phoneagent.LaunchProxyActivity
 import com.ai.phoneagent.PhoneAgentAccessibilityService
@@ -659,6 +661,7 @@ class ActionExecutor(
                         "elementtext",
                         "label"
                 )
+        val desc = readField(action.fields, "desc", "description", "comment")
         val index = action.fields["index"]?.trim()?.toIntOrNull() ?: 0
 
         val selectorOk =
@@ -694,12 +697,27 @@ class ActionExecutor(
             return true
         }
 
-        val element =
+        var element =
                 ActionUtils.parsePoint(action.fields["element"])
                         ?: ActionUtils.parsePoint(action.fields["point"])
                                 ?: ActionUtils.parsePoint(action.fields["pos"])
-        val xRel = ActionUtils.parseCoordinate(action.fields["x"]) ?: element?.first ?: return false
-        val yRel = ActionUtils.parseCoordinate(action.fields["y"]) ?: element?.second ?: return false
+        var xRel = ActionUtils.parseCoordinate(action.fields["x"]) ?: element?.first ?: return false
+        var yRel = ActionUtils.parseCoordinate(action.fields["y"]) ?: element?.second ?: return false
+
+        // 坐标校正：如果有 desc 字段，尝试直接定位并点击目标元素
+        // 注意：虚拟屏模式下不使用文本定位，因为 rootInActiveWindow 获取的是主屏窗口
+        if (!desc.isNullOrBlank() && service != null && !isVirtualDisplayMode()) {
+            val targetKeywords = desc.replace(Regex("[点击滑动输入长按]"), "").trim()
+            if (targetKeywords.isNotBlank()) {
+                onLog("尝试文本定位: '$targetKeywords'")
+                val clicked = clickElementByText(service, targetKeywords, onLog)
+                if (clicked) {
+                    onLog("✓ 文本定位点击成功: '$targetKeywords'")
+                    return true
+                }
+                onLog("⚠️ 文本定位失败，使用坐标点击: ($xRel,$yRel)")
+            }
+        }
 
         val (x, y) = ActionUtils.parsePointToScreen(xRel to yRel, screenW, screenH)
         onLog("执行操作: 点击($xRel,$yRel)")
@@ -1354,6 +1372,120 @@ class ActionExecutor(
     ) {
         val suffix = if (detail.isBlank()) "" else " $detail"
         onLog("[Type][Shizuku] $stage=$status$suffix")
+    }
+
+    private fun findElementCenterFromUiDump(uiDump: String, targetText: String): Pair<Int, Int>? {
+        val textAttrRegex = Regex("""text="([^"]*)"""")
+        val boundsAttrRegex = Regex("""bounds="\[(\d+),(\d+)]\[(\d+),(\d+)]"""")
+
+        val nodeParts = uiDump.split(Regex("""(?=<node[\s/>])"""))
+        for (part in nodeParts) {
+            if (!part.startsWith("<node")) continue
+            val textMatch = textAttrRegex.find(part)
+            val nodeText = textMatch?.groupValues?.get(1) ?: continue
+            if (nodeText.isBlank()) continue
+            if (nodeText != targetText &&
+                !nodeText.contains(targetText, ignoreCase = true) &&
+                !targetText.contains(nodeText, ignoreCase = true)) continue
+            val boundsMatch = boundsAttrRegex.find(part) ?: continue
+            val l = boundsMatch.groupValues[1].toIntOrNull() ?: continue
+            val t = boundsMatch.groupValues[2].toIntOrNull() ?: continue
+            val r = boundsMatch.groupValues[3].toIntOrNull() ?: continue
+            val b = boundsMatch.groupValues[4].toIntOrNull() ?: continue
+            return ((l + r) / 2) to ((t + b) / 2)
+        }
+
+        return null
+    }
+
+    private fun findElementCenterByAccessibility(
+        service: PhoneAgentAccessibilityService,
+        targetText: String,
+        screenW: Int,
+        screenH: Int
+    ): Pair<Int, Int>? {
+        try {
+            val root = service.rootInActiveWindow ?: return null
+            val nodes = root.findAccessibilityNodeInfosByText(targetText)
+            if (nodes.isNullOrEmpty()) return null
+            for (node in nodes) {
+                if (!node.isVisibleToUser) continue
+                val rect = android.graphics.Rect()
+                node.getBoundsInScreen(rect)
+                if (rect.width() <= 0 || rect.height() <= 0) continue
+                val cx = rect.centerX()
+                val cy = rect.centerY()
+                if (cx in 0 until screenW && cy in 0 until screenH) {
+                    return cx to cy
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("ActionExecutor", "findElementCenterByAccessibility failed", e)
+        }
+        return null
+    }
+
+    private suspend fun clickElementByText(
+        service: PhoneAgentAccessibilityService,
+        targetText: String,
+        onLog: (String) -> Unit
+    ): Boolean {
+        try {
+            val root = service.rootInActiveWindow ?: return false
+            val nodes = root.findAccessibilityNodeInfosByText(targetText)
+            if (nodes.isNullOrEmpty()) {
+                onLog("  文本搜索: 未找到 '$targetText'")
+                return false
+            }
+            onLog("  文本搜索: 找到 ${nodes.size} 个包含 '$targetText' 的节点")
+            for ((idx, node) in nodes.withIndex()) {
+                if (!node.isVisibleToUser) {
+                    onLog("  节点[$idx]: 不可见，跳过")
+                    continue
+                }
+                val nodeText = node.text?.toString() ?: ""
+                val nodeDesc = node.contentDescription?.toString() ?: ""
+                onLog("  节点[$idx]: text='$nodeText', desc='$nodeDesc', clickable=${node.isClickable}")
+
+                val clicked = if (node.isClickable) {
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                } else {
+                    var parent = node.parent
+                    var depth = 0
+                    var parentClicked = false
+                    while (parent != null && depth < 5) {
+                        if (parent.isClickable) {
+                            onLog("  节点[$idx]: 找到可点击父节点(深度$depth)")
+                            parentClicked = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                            break
+                        }
+                        parent = parent.parent
+                        depth++
+                    }
+                    if (!parentClicked) {
+                        onLog("  节点[$idx]: 无可点击父节点，尝试直接点击")
+                        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    } else {
+                        true
+                    }
+                }
+
+                if (clicked) {
+                    onLog("  performAction 返回 true，等待窗口事件...")
+                    service.awaitWindowEvent(
+                        service.lastWindowEventTime(),
+                        timeoutMs = config.tapAwaitWindowTimeoutMs
+                    )
+                    return true
+                } else {
+                    onLog("  performAction 返回 false，尝试下一个节点")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("ActionExecutor", "clickElementByText failed", e)
+            onLog("  clickElementByText 异常: ${e.message}")
+        }
+        return false
     }
 }
 

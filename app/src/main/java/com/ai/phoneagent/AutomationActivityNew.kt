@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Aries AI - Android UI Automation Framework
  * Copyright (C) 2025-2026 ZG0704666
  *
@@ -76,6 +76,7 @@ import kotlinx.coroutines.withContext
 class AutomationActivityNew : AppCompatActivity() {
 
     companion object {
+        private const val TAG = "AutomationActivityNew"
         const val EXTRA_FORCE_TOP_ON_ENTRY = "force_top_on_entry"
         const val EXTRA_AUTOMATION_TASK = "automation_task"
         const val EXTRA_AUTOMATION_SOURCE = "automation_source"
@@ -120,6 +121,7 @@ class AutomationActivityNew : AppCompatActivity() {
     private var isBackgroundMode: Boolean = false // true = 后台虚拟屏模式, false = 前端执行模式
 
     private var sherpaSpeechRecognizer: SherpaSpeechRecognizer? = null
+    private var simpleTTS: com.ai.phoneagent.speech.SimpleTTS? = null
     private var isListening: Boolean = false
     private var micAnimator: ObjectAnimator? = null
     private var voiceInputAnimJob: Job? = null
@@ -457,6 +459,7 @@ class AutomationActivityNew : AppCompatActivity() {
         }
 
         initSherpaModel()
+        simpleTTS = com.ai.phoneagent.speech.SimpleTTS(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -555,6 +558,8 @@ class AutomationActivityNew : AppCompatActivity() {
         safeIntent.removeExtra(EXTRA_AUTOMATION_AUTO_START)
         safeIntent.removeExtra(EXTRA_KEEP_MAIN_ON_TOP)
 
+        Log.d(TAG, "consumeDispatchedInstruction: task='$task', source='$source', autoStart=$autoStart")
+
         mirrorLogsToMain =
                 source == AutomationInstructionRequest.Source.MANUAL_AGENT_MODE.wireValue ||
                         source == AutomationInstructionRequest.Source.ADVANCED_AI.wireValue
@@ -569,10 +574,14 @@ class AutomationActivityNew : AppCompatActivity() {
         }
         appendLog("接收任务：$task")
 
-        if (!autoStart) return
+        if (!autoStart) {
+            Log.d(TAG, "consumeDispatchedInstruction: autoStart=false, not starting agent")
+            return
+        }
 
         if (agentJob != null) {
             appendLog("当前自动化任务仍在执行，暂不自动启动新任务")
+            Log.w(TAG, "consumeDispatchedInstruction: agentJob already running, skipping")
             Toast.makeText(this, "当前有任务在执行，请先停止再重试", Toast.LENGTH_SHORT).show()
             return
         }
@@ -580,6 +589,7 @@ class AutomationActivityNew : AppCompatActivity() {
         if (keepMainOnTop) {
             bringMainActivityToFront()
         }
+        Log.d(TAG, "consumeDispatchedInstruction: posting startAgent()")
         binding.root.post {
             if (agentJob == null) {
                 startAgent()
@@ -833,12 +843,45 @@ class AutomationActivityNew : AppCompatActivity() {
         return enabled
     }
 
+    private suspend fun forceRebindAccessibilityService(): Boolean {
+        if (PhoneAgentAccessibilityService.instance != null) return true
+        try {
+            val resolver = contentResolver
+            val currentlyEnabled = isAccessibilityServiceEnabled()
+            Log.d(TAG, "forceRebind: currentlyEnabled=$currentlyEnabled, instance=${PhoneAgentAccessibilityService.instance != null}")
+            if (currentlyEnabled) {
+                Settings.Secure.putString(resolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, "")
+                delay(300)
+            }
+            Settings.Secure.putString(resolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, serviceId)
+            Settings.Secure.putInt(resolver, Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+            delay(500)
+        } catch (e: Exception) {
+            Log.w(TAG, "forceRebind: failed to toggle settings", e)
+            return false
+        }
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < 5000) {
+            if (PhoneAgentAccessibilityService.instance != null) {
+                Log.d(TAG, "forceRebind: service connected after toggle")
+                return true
+            }
+            delay(200)
+        }
+        Log.w(TAG, "forceRebind: service still not connected after toggle")
+        return false
+    }
+
     /** 启动Agent */
     private fun startAgent() {
-        if (agentJob != null) return
+        if (agentJob != null) {
+            Log.w(TAG, "startAgent: agentJob already running, skip")
+            return
+        }
 
         val task = etTask.text?.toString().orEmpty().trim()
         if (task.isBlank()) {
+            Log.w(TAG, "startAgent: task is blank")
             Toast.makeText(this, "请输入任务", Toast.LENGTH_SHORT).show()
             return
         }
@@ -846,11 +889,14 @@ class AutomationActivityNew : AppCompatActivity() {
 
         val localModelEnabled = isLocalModelEnabled()
         val apiKey = getApiKey()
+        Log.d(TAG, "startAgent: task='$task', localModel=$localModelEnabled, apiKeyBlank=${apiKey.isBlank()}, modelReady=${ModelScopeModelDownloader.isQwen35ModelReady(this)}")
         if (!localModelEnabled && apiKey.isBlank()) {
+            Log.w(TAG, "startAgent: no local model and no API key")
             Toast.makeText(this, "请先在侧边栏配置 API Key", Toast.LENGTH_SHORT).show()
             return
         }
         if (localModelEnabled && !ModelScopeModelDownloader.isQwen35ModelReady(this)) {
+            Log.w(TAG, "startAgent: local model enabled but not ready")
             Toast.makeText(this, "本地模型未就绪，请先在主界面下载模型", Toast.LENGTH_SHORT).show()
             return
         }
@@ -890,6 +936,7 @@ class AutomationActivityNew : AppCompatActivity() {
             }
         }
         val state = collectRuntimeConnectionState()
+        Log.d(TAG, "startAgent: state=$state, useShizuku=$useShizukuInteraction")
         var effectiveUseShizuku = resolveRuntimeInteractionPreference(useShizukuInteraction, state)
         if (effectiveUseShizuku == null &&
                 allowAccessibilityPendingConnection &&
@@ -897,6 +944,18 @@ class AutomationActivityNew : AppCompatActivity() {
                 state.accessibilityEnabled) {
             // 主页派发场景下，刚通过 Shizuku 打开无障碍时允许继续启动，后续再等待服务实例接入。
             effectiveUseShizuku = false
+        }
+        if (effectiveUseShizuku == null && !useShizukuInteraction && state.accessibilityEnabled) {
+            effectiveUseShizuku = false
+        }
+        if (effectiveUseShizuku == null && !useShizukuInteraction && !state.accessibilityConnected) {
+            try {
+                val hasWriteSecure = checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (hasWriteSecure) {
+                    Log.d(TAG, "startAgent: WRITE_SECURE_GRANTED, will auto-enable accessibility")
+                    effectiveUseShizuku = false
+                }
+            } catch (_: Exception) {}
         }
 
         if (effectiveUseShizuku == null) {
@@ -915,6 +974,7 @@ class AutomationActivityNew : AppCompatActivity() {
                     } else {
                         "当前无可用连接，请检查 Shizuku/无障碍状态"
                     }
+            Log.w(TAG, "startAgent: no effective connection, msg='$msg'")
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             checkAccessibilityStatus()
             return
@@ -955,9 +1015,14 @@ class AutomationActivityNew : AppCompatActivity() {
         btnPauseAgent.text = "暂停"
         btnStopAgent.isEnabled = true
 
+        Log.d(TAG, "startAgent: launching agent coroutine, task='$task'")
         agentJob =
                 lifecycleScope.launch(Dispatchers.Default) {
                     try {
+                        if (!effectiveUseShizuku && PhoneAgentAccessibilityService.instance == null) {
+                            val rebind = forceRebindAccessibilityService()
+                            if (rebind) appendLog("已自动修复无障碍服务连接")
+                        }
                         val svc =
                                 if (effectiveUseShizuku) {
                                     waitForAccessibilityServiceConnection(timeoutMs = 4500L)
@@ -1000,6 +1065,10 @@ class AutomationActivityNew : AppCompatActivity() {
                                         control =
                                                 object : UiAutomationAgent.Control {
                                                     override fun isPaused(): Boolean = paused
+
+                                                    override fun speak(text: String) {
+                                                        simpleTTS?.speak(text)
+                                                    }
 
                                                     override suspend fun confirm(
                                                             message: String
@@ -1067,7 +1136,21 @@ class AutomationActivityNew : AppCompatActivity() {
                                         },
                                 )
                         appendLog("结束：${result.message}（steps=${result.steps}）")
+                        if (result.stepSummary.isNotBlank()) {
+                            appendLog(result.stepSummary)
+                        }
+                        if (result.fraudWarning.isNotBlank()) {
+                            appendLog("\n${result.fraudWarning}\n")
+                        }
                         AutomationOverlay.complete(result.message)
+
+                        // 语音播报结果摘要
+                        val speakText = if (result.fraudWarning.isNotBlank()) {
+                            "${result.message}。${result.fraudWarning}"
+                        } else {
+                            result.message
+                        }
+                        simpleTTS?.speak(speakText)
 
                         // 保存运行结果
                         val logText = withContext(Dispatchers.Main) { tvLog.text?.toString() ?: "" }
@@ -1184,45 +1267,17 @@ class AutomationActivityNew : AppCompatActivity() {
     private fun initSherpaModel() {
         lifecycleScope.launch {
             try {
-                // 检查Activity是否已销毁
-                if (isDestroyed || isFinishing) {
-                    return@launch
-                }
+                if (isDestroyed || isFinishing) return@launch
 
                 sherpaSpeechRecognizer = SherpaSpeechRecognizer(this@AutomationActivityNew)
                 val success = sherpaSpeechRecognizer?.initialize() == true
                 if (!success) {
-                    if (!isDestroyed && !isFinishing) {
-                        withContext(Dispatchers.Main) {
-                            if (!isDestroyed && !isFinishing) {
-                                Toast.makeText(
-                                                this@AutomationActivityNew,
-                                                "语音模型初始化失败，请重试",
-                                                Toast.LENGTH_LONG
-                                        )
-                                        .show()
-                            }
-                        }
-                    }
+                    Log.w(TAG, "Sherpa-NCNN voice model init failed (non-blocking)")
+                } else {
+                    Log.d(TAG, "Sherpa-NCNN voice model initialized OK")
                 }
             } catch (e: Exception) {
-                Log.e("AutomationActivityNew", "语音模型初始化异常: ${e.message}", e)
-                if (!isDestroyed && !isFinishing) {
-                    try {
-                        withContext(Dispatchers.Main) {
-                            if (!isDestroyed && !isFinishing) {
-                                Toast.makeText(
-                                                this@AutomationActivityNew,
-                                                "语音模型异常: ${e.message}",
-                                                Toast.LENGTH_LONG
-                                        )
-                                        .show()
-                            }
-                        }
-                    } catch (toastException: Exception) {
-                        Log.e("AutomationActivityNew", "Toast显示失败: ${toastException.message}")
-                    }
-                }
+                Log.w(TAG, "Sherpa-NCNN voice model init exception: ${e.message}")
             }
         }
     }
@@ -1434,6 +1489,7 @@ class AutomationActivityNew : AppCompatActivity() {
 
     /** 添加日志 */
     private fun appendLog(message: String) {
+        Log.d(TAG, "[LOG] $message")
         runOnUiThread {
             tvLog.append("$message\n")
             AutomationOverlay.updateFromLogLine(message)
@@ -1442,7 +1498,6 @@ class AutomationActivityNew : AppCompatActivity() {
             }
 
             if (autoScrollLogToBottom) {
-                // 自动滚动到底部
                 val scrollView = binding.root.findViewById<NestedScrollView>(R.id.scrollLog)
                 scrollView?.post { scrollView.fullScroll(android.view.View.FOCUS_DOWN) }
             }

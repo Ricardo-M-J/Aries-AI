@@ -86,6 +86,9 @@ import android.widget.ImageView
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.EditText
+import android.widget.Spinner
+import android.widget.ArrayAdapter
+import android.widget.AdapterView
 import com.ai.phoneagent.helper.StreamRenderHelper
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -1139,12 +1142,9 @@ class MainActivity : AppCompatActivity() {
     private fun updateLocalModelSwitchAvailabilityUi() {
         if (!::localModelSwitchRow.isInitialized || !::localModelSwitch.isInitialized) return
 
-        if (localModelReady) {
-            localModelSwitchRow.visibility = View.VISIBLE
-            return
-        }
+        localModelSwitchRow.visibility = View.VISIBLE
 
-        localModelSwitchRow.visibility = View.GONE
+        if (localModelReady) return
 
         val prefEnabled = prefs.getBoolean(apiUseLocalModelPref, false)
         val switchEnabled = localModelSwitch.isChecked
@@ -1162,11 +1162,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateQwenDownloadButtonState() {
         val button = qwenDownloadButton ?: return
-        val shouldShow = prefs.getBoolean(localModelDownloadButtonVisiblePref, false)
-        if (!shouldShow) {
-            button.visibility = View.GONE
-            return
-        }
         button.visibility = View.VISIBLE
         when {
             qwenDownloadInFlight -> {
@@ -1764,7 +1759,45 @@ class MainActivity : AppCompatActivity() {
         apiThirdPartyContainer = header.findViewById<View>(R.id.apiThirdPartyContainer)
         apiBaseUrlInput = header.findViewById<EditText>(R.id.apiBaseUrlInput)
         apiModelInput = header.findViewById<EditText>(R.id.apiModelInput)
+        val apiPresetSpinner = header.findViewById<Spinner>(R.id.apiPresetSpinner)
         localModelReady = ModelScopeModelDownloader.isQwen35ModelReady(this)
+        
+        val presetNames = AutoGlmClient.API_PRESETS.keys.toList()
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, presetNames)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        apiPresetSpinner.adapter = adapter
+        
+        var spinnerInitializing = true
+        apiPresetSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (spinnerInitializing) return
+                val selectedName = presetNames[position]
+                val (baseUrl, model) = AutoGlmClient.API_PRESETS[selectedName] ?: return
+                
+                suppressApiInputWatcher = true
+                apiBaseUrlInput.setText(baseUrl)
+                apiModelInput.setText(model)
+                prefs.edit()
+                    .putString(apiThirdPartyBaseUrlPref, baseUrl)
+                    .putString(apiThirdPartyModelPref, model)
+                    .apply()
+                suppressApiInputWatcher = false
+                apiNeedsRecheckToastShown = false
+                onApiConfigPotentiallyChanged(showNeedsCheckMessage = true)
+            }
+            
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        
+        val currentBaseUrl = prefs.getString(apiThirdPartyBaseUrlPref, AutoGlmClient.DEFAULT_BASE_URL)
+        val matchIndex = presetNames.indexOfFirst { name ->
+            val (url, _) = AutoGlmClient.API_PRESETS[name] ?: return@indexOfFirst false
+            url == currentBaseUrl
+        }
+        if (matchIndex >= 0) {
+            apiPresetSpinner.setSelection(matchIndex)
+        }
+        spinnerInitializing = false
 
         apiThirdPartySwitch.isChecked = prefs.getBoolean(apiUseThirdPartyPref, false)
         apiThirdPartyContainer.visibility =
